@@ -1,0 +1,14 @@
+[Unit]
+Description=Apache Kafka lab broker and KRaft controller
+After=network.target
+
+[Service]
+User=kafka
+Group=kafka
+Environment=LOG_DIR=/var/log/kafka
+Environment="KAFKA_HEAP_OPTS=-Xms256m -Xmx512m"
+ExecStart=/opt/kafka/bin/kafka-server-start.sh /etc/kafka/server.properties
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

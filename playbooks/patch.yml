@@ -1,0 +1,191 @@
+---
+- name: Patch the approved standalone Redis hosts one at a time
+  hosts: patch_targets
+  serial: 1
+  any_errors_fatal: true
+  become: true
+  vars:
+    hold_path: /var/lib/playbook-forge-redis.hold
+    build_query: "%{VERSION}-%{RELEASE}.%{ARCH}"
+    host_arch: "{{ ansible_facts['architecture'] }}"
+    baseline_build: "{{ redis_from }}.{{ host_arch }}"
+    approved_build: "{{ redis_to }}.{{ host_arch }}"
+  tasks:
+    - name: Check the host identity and approved change inputs
+      ansible.builtin.assert:
+        that:
+          - ansible_facts['hostname'] == expected_hostname
+          - ansible_facts['os_family'] == 'RedHat' and ansible_facts['distribution_major_version'] == '9'
+          - redis_from != redis_to
+          - redis_stage is match('^/')
+          - kafka_bootstrap is undefined or kafka_bin is defined
+
+    - name: Check for an interrupted or held run
+      ansible.builtin.stat:
+        path: "{{ hold_path }}"
+      register: hold
+
+    - name: Require a reconciled starting state
+      ansible.builtin.assert:
+        that: not hold.stat.exists
+        fail_msg: "Host is held at {{ hold_path }}. Review the previous run and verify recovery before releasing it."
+
+    - name: Read the installed Redis build
+      ansible.builtin.command:
+        argv: [rpm, -q, --queryformat, "{{ build_query }}", redis]
+      register: installed
+      changed_when: false
+
+    - name: Accept only the approved baseline or target build
+      ansible.builtin.assert:
+        that: installed.stdout in [baseline_build, approved_build]
+
+    - name: Check whether the host already needs a reboot
+      ansible.builtin.command: needs-restarting -r
+      register: reboot_hint
+      changed_when: false
+      failed_when: reboot_hint.rc not in [0, 1]
+
+    - name: Hold an outstanding system reboot outside this package change
+      ansible.builtin.assert:
+        that: reboot_hint.rc == 0 or (installed.stdout == baseline_build and patch_reboot | default(false) | bool)
+        fail_msg: "The host reports an outstanding reboot. Review it before treating this patch window as complete."
+
+    - name: Verify baseline platform health and running version
+      ansible.builtin.import_tasks: tasks/health.yml
+      vars:
+        expected_redis_version: "{{ installed.stdout.split('-')[0] }}"
+
+    - name: Measure free space on the package and state filesystems
+      ansible.builtin.command: df -m --output=avail /usr /var
+      register: free_space
+      changed_when: false
+
+    - name: Require space for the transaction and its recovery
+      ansible.builtin.assert:
+        that: (free_space.stdout_lines[1:] | map('trim') | map('int') | min) >= (patch_min_free_mib | default(256) | int)
+      when: installed.stdout != approved_build
+
+    - name: Check the RPMs needed for this change
+      ansible.builtin.include_tasks: tasks/check-rpm.yml
+      loop: "{{ [redis_to, redis_from] if patch_rollback_approved | default(false) | bool else [redis_to] }}"
+      loop_control:
+        loop_var: rpm_release
+      when: installed.stdout != approved_build
+
+    - name: Confirm the offline DNF transaction resolves
+      ansible.builtin.dnf:
+        name: "{{ redis_stage }}/redis-{{ approved_build }}.rpm"
+        state: present
+        disablerepo: '*'
+        install_weak_deps: false
+        update_cache: false
+      check_mode: true
+      changed_when: false
+      when: installed.stdout != approved_build
+
+    - name: Record readiness and intended action
+      ansible.builtin.debug:
+        msg:
+          host: "{{ inventory_hostname }}"
+          before: "{{ installed.stdout }}"
+          approved: "{{ approved_build }}"
+          decision: "{{ 'already current and healthy' if installed.stdout == approved_build else 'ready to patch' }}"
+
+    - name: Apply the approved change
+      when:
+        - patch_apply | default(false) | bool
+        - installed.stdout != approved_build
+      block:
+        - name: Acquire an exclusive host hold before making changes
+          ansible.builtin.command:
+            argv: [mkdir, -m, '0700', "{{ hold_path }}"]
+
+        - name: Recheck the starting build under the hold
+          ansible.builtin.command:
+            argv: [rpm, -q, --queryformat, "{{ build_query }}", redis]
+          register: locked_build
+          changed_when: false
+          failed_when: locked_build.rc != 0 or locked_build.stdout != baseline_build
+
+        - name: Install the approved staged Redis RPM offline
+          ansible.builtin.dnf:
+            name: "{{ redis_stage }}/redis-{{ approved_build }}.rpm"
+            state: present
+            disablerepo: '*'
+            install_weak_deps: false
+
+        - name: Reboot and reconnect if the change requires it
+          ansible.builtin.reboot:
+            reboot_timeout: 240
+          when: patch_reboot | default(false) | bool
+
+        - name: Activate and verify the patched service
+          block:
+            - name: Restart Redis when the host stayed up
+              ansible.builtin.systemd_service:
+                name: redis
+                state: restarted
+              when: not (patch_reboot | default(false) | bool)
+
+            - name: Verify the installed build
+              ansible.builtin.command:
+                argv: [rpm, -q, --queryformat, "{{ build_query }}", redis]
+              register: after_install
+              changed_when: false
+              failed_when: after_install.rc != 0 or after_install.stdout != approved_build
+
+            - name: Verify post-patch platform health
+              ansible.builtin.import_tasks: tasks/health.yml
+              vars:
+                expected_redis_version: "{{ redis_to.split('-')[0] }}"
+
+          rescue:
+            - name: Require explicit approval for this exact rollback
+              ansible.builtin.assert:
+                that: patch_rollback_approved | default(false) | bool
+                fail_msg: "Verification failed. Host remains held for manual recovery."
+
+            - name: Confirm the target build is installed before reversing it
+              ansible.builtin.command:
+                argv: [rpm, -q, --queryformat, "{{ build_query }}", redis]
+              register: rollback_start
+              changed_when: false
+              failed_when: rollback_start.rc != 0 or rollback_start.stdout != approved_build
+
+            - name: Reinstall the approved prior Redis build offline
+              ansible.builtin.dnf:
+                name: "{{ redis_stage }}/redis-{{ baseline_build }}.rpm"
+                state: present
+                disablerepo: '*'
+                allow_downgrade: true
+                install_weak_deps: false
+
+            - name: Restart the restored Redis build
+              ansible.builtin.systemd_service:
+                name: redis
+                state: restarted
+
+            - name: Verify the exact recovered package
+              ansible.builtin.command:
+                argv: [rpm, -q, --queryformat, "{{ build_query }}", redis]
+              register: restored
+              changed_when: false
+              failed_when: restored.rc != 0 or restored.stdout != baseline_build
+
+            - name: Verify recovered platform health
+              ansible.builtin.import_tasks: tasks/health.yml
+              vars:
+                expected_redis_version: "{{ redis_from.split('-')[0] }}"
+
+            - name: Hold the group after a verified rollback
+              ansible.builtin.fail:
+                msg: "Rolled Redis back to {{ restored.stdout }} and verified platform health. Group held for Engineer review."
+
+        - name: Release the host only after successful verification
+          ansible.builtin.command:
+            argv: [rmdir, "{{ hold_path }}"]
+
+        - name: Record the completed change
+          ansible.builtin.debug:
+            msg: "Verified {{ inventory_hostname }} at Redis {{ after_install.stdout }}; platform checks passed."

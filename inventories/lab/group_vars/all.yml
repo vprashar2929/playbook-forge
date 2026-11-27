@@ -1,0 +1,15 @@
+redis_stage: /var/lib/forge-rpms
+redis_from: 6.2.22-1.el9_8
+redis_to: 6.2.24-1.el9_8
+redis_checksums:
+  aarch64:
+    6.2.22-1.el9_8: 1a4446de12ac5e58ba391e477f75ed80c2446bdcabf1dc7998d897784aab1473
+    6.2.24-1.el9_8: 652b6d2d8a8afa8b20a25f7d4b0df94d5f78f5377f82c783f6d8588dae3eb592
+  x86_64:
+    6.2.22-1.el9_8: 2b52121bc0328c774219826c445e5474f97f8dbcb9865b2969de68ede37a8a6c
+    6.2.24-1.el9_8: 773e5aa399c719ace6426808f46e760fb527d54fb6f3628cb66c2d285a3d93bb
+patch_reboot: true
+# This pair is exercised on disposable, standalone Redis data in the lab.
+patch_rollback_approved: true
+kafka_bootstrap: 127.0.0.1:9092
+kafka_bin: /opt/kafka/bin

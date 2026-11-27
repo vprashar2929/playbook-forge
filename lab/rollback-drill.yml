@@ -1,0 +1,93 @@
+---
+- name: Exercise the real patch recovery path on a fresh Lima lab
+  hosts: lab
+  become: true
+  vars:
+    fixture: /etc/systemd/system/redis.service.d/90-forge-drill.conf
+    hold_path: /var/lib/playbook-forge-redis.hold
+  tasks:
+    - name: Confirm this is the disposable guest
+      ansible.builtin.slurp:
+        src: /etc/playbook-forge-lab
+      register: marker
+
+    - name: Read the starting Redis build
+      ansible.builtin.command:
+        argv: [rpm, -q, --queryformat, "%{VERSION}-%{RELEASE}", redis]
+      register: starting
+      changed_when: false
+
+    - name: Check for an existing fixture or hold
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      loop: "{{ [fixture, hold_path] }}"
+      register: paths
+
+    - name: Require a fresh lab at the old package version
+      ansible.builtin.assert:
+        that:
+          - marker.content | b64decode | trim == 'local-patching-pilot-v1'
+          - starting.stdout == redis_from
+          - paths.results | selectattr('stat.exists') | list | length == 0
+          - ansible_play_hosts_all | length == 1
+
+    - name: Create the lab systemd override directory
+      ansible.builtin.file:
+        path: /etc/systemd/system/redis.service.d
+        state: directory
+        mode: '0755'
+
+    - name: Run a change that fails to activate the target Redis binary
+      block:
+        - name: Make only the target version fail its systemd start check
+          ansible.builtin.copy:
+            dest: "{{ fixture }}"
+            mode: '0644'
+            content: |
+              [Service]
+              ExecStartPre=/bin/sh -c '! /usr/bin/redis-server --version | /usr/bin/grep -Fq "v={{ redis_to.split("-")[0] }} "'
+
+        - name: Load the temporary start check
+          ansible.builtin.systemd_service:
+            daemon_reload: true
+
+        - name: Run the regular patch entry point from the Mac
+          delegate_to: localhost
+          become: false
+          ansible.builtin.command:
+            argv:
+              - "{{ playbook_dir }}/../scripts/run-patch"
+              - -i
+              - "{{ inventory_file }}"
+              - --limit
+              - "{{ inventory_hostname }}"
+              - -e
+              - patch_apply=true
+              - -e
+              - patch_reboot=false
+          register: drill
+          failed_when: drill.rc != 2 or 'Group held for Engineer review.' not in drill.stdout
+
+        - name: Verify the durable hold
+          ansible.builtin.stat:
+            path: "{{ hold_path }}"
+          register: held
+
+        - name: Require a held run
+          ansible.builtin.assert:
+            that: held.stat.isdir | default(false)
+
+        - name: Verify recovered services independently
+          ansible.builtin.import_tasks: ../playbooks/tasks/health.yml
+          vars:
+            expected_redis_version: "{{ redis_from.split('-')[0] }}"
+
+      always:
+        - name: Remove the lab fault
+          ansible.builtin.file:
+            path: "{{ fixture }}"
+            state: absent
+
+        - name: Reload normal systemd settings
+          ansible.builtin.systemd_service:
+            daemon_reload: true
