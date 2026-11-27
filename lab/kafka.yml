@@ -1,0 +1,89 @@
+---
+- name: Create the Kafka service account
+  ansible.builtin.user:
+    name: kafka
+    system: true
+    home: /var/lib/kafka
+    create_home: false
+    shell: /sbin/nologin
+
+- name: Create Kafka directories
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: "{{ item.owner }}"
+    mode: '0755'
+  loop:
+    - {path: /etc/kafka, owner: root}
+    - {path: /var/lib/kafka, owner: kafka}
+    - {path: /var/log/kafka, owner: kafka}
+
+- name: Download the pinned Kafka distribution
+  ansible.builtin.get_url:
+    url: "https://archive.apache.org/dist/kafka/{{ kafka_version }}/{{ kafka_archive }}"
+    dest: "/var/cache/{{ kafka_archive }}"
+    checksum: "sha512:{{ kafka_sha512 }}"
+    mode: '0644'
+    timeout: 180
+
+- name: Extract the verified distribution
+  ansible.builtin.unarchive:
+    src: "/var/cache/{{ kafka_archive }}"
+    remote_src: true
+    dest: /opt
+    creates: "{{ kafka_dir }}/bin/kafka-server-start.sh"
+    owner: root
+    group: root
+
+- name: Link the installed Kafka distribution
+  ansible.builtin.file:
+    src: "{{ kafka_dir }}"
+    dest: /opt/kafka
+    state: link
+
+- name: Install single-node KRaft settings
+  ansible.builtin.copy:
+    dest: /etc/kafka/server.properties
+    mode: '0644'
+    content: |
+      process.roles=broker,controller
+      node.id=1
+      controller.listener.names=CONTROLLER
+      listeners=PLAINTEXT://127.0.0.1:9092,CONTROLLER://127.0.0.1:9093
+      advertised.listeners=PLAINTEXT://127.0.0.1:9092,CONTROLLER://127.0.0.1:9093
+      controller.quorum.bootstrap.servers=127.0.0.1:9093
+      listener.security.protocol.map=CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      inter.broker.listener.name=PLAINTEXT
+      log.dirs=/var/lib/kafka
+      offsets.topic.replication.factor=1
+      transaction.state.log.replication.factor=1
+      transaction.state.log.min.isr=1
+      share.coordinator.state.topic.replication.factor=1
+      share.coordinator.state.topic.min.isr=1
+  notify: Restart Kafka
+
+- name: Check for existing KRaft storage
+  ansible.builtin.stat:
+    path: /var/lib/kafka/meta.properties
+  register: kafka_storage
+
+- name: Initialize new KRaft storage
+  when: not kafka_storage.stat.exists
+  block:
+    - name: Generate the cluster identity
+      ansible.builtin.command: /opt/kafka/bin/kafka-storage.sh random-uuid
+      register: kafka_id
+      changed_when: false
+
+    - name: Format the empty lab broker
+      ansible.builtin.command:
+        argv: [runuser, -u, kafka, --, /opt/kafka/bin/kafka-storage.sh, format, --standalone, -t, "{{ kafka_id.stdout | trim }}", -c, /etc/kafka/server.properties]
+      environment:
+        LOG_DIR: /var/log/kafka
+
+- name: Install the Kafka systemd unit
+  ansible.builtin.copy:
+    src: kafka.service
+    dest: /etc/systemd/system/kafka.service
+    mode: '0644'
+  notify: Restart Kafka

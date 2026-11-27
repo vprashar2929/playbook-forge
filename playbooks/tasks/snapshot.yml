@@ -1,0 +1,15 @@
+---
+- name: Capture installed RPMs with architecture and epoch
+  ansible.builtin.command:
+    argv: [rpm, -qa, --queryformat, "%{NAME} %{EPOCHNUM}:%{VERSION}-%{RELEASE} %{ARCH}\n"]
+  register: rpm_inventory
+  changed_when: false
+
+- name: Save the complete package inventory on the controller
+  delegate_to: localhost
+  become: false
+  ansible.builtin.copy:
+    dest: "{{ lookup('env','FORGE_WINDOW') }}/rpm-{{ inventory_hostname | hash('sha256') }}-{{ snapshot_phase }}.txt"
+    mode: '0600'
+    content: "{{ (rpm_inventory.stdout_lines | sort | join('\n')) ~ '\n' }}"
+  changed_when: false

@@ -1,9 +1,4 @@
 #!/bin/sh
 set -eu
 root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
-umask 077
-mkdir -p "$root/.run"
-ANSIBLE_LOG_PATH=$(mktemp "$root/.run/patch.XXXXXXXX")
-export ANSIBLE_LOG_PATH
-printf 'Controller log: %s\n' "$ANSIBLE_LOG_PATH"
-exec "$root/.venv/bin/ansible-playbook" "$root/playbooks/patch.yml" "$@"
+exec "$root/.venv/bin/python" "$root/scripts/window.py" "$@"

@@ -1,40 +1,12 @@
 ---
-- name: Query Redis with the inventory connection settings
-  environment: "{{ {'REDISCLI_AUTH': redis_password} if redis_password is defined else {} }}"
-  no_log: "{{ redis_password is defined }}"
-  block:
-    - name: Wait for Redis to serve requests
-      ansible.builtin.command:
-        argv: "{{ ['redis-cli', '--raw'] + (redis_cli_args | default([])) + ['PING'] }}"
-      register: redis_ping
-      changed_when: false
-      until: redis_ping.rc == 0 and redis_ping.stdout | trim == 'PONG'
-      retries: 12
-      delay: 5
-
-    - name: Read the running Redis version and topology
-      ansible.builtin.command:
-        argv: "{{ ['redis-cli', '--raw'] + (redis_cli_args | default([])) + ['INFO'] }}"
-      register: redis_info
-      changed_when: false
-
-- name: Verify that this host runs standalone Redis without replicas
-  ansible.builtin.assert:
-    that:
-      - "'role:master' in redis_info.stdout_lines"
-      - "'connected_slaves:0' in redis_info.stdout_lines"
-      - "'cluster_enabled:0' in redis_info.stdout_lines"
-      - expected_redis_version is undefined or ('redis_version:' ~ expected_redis_version) in redis_info.stdout_lines
-
-- name: Wait for the colocated Kafka metadata quorum to report a leader
+- name: Verify the assigned systemd service
   ansible.builtin.command:
-    argv: >-
-      {{ ['timeout', '20', kafka_bin ~ '/kafka-metadata-quorum.sh', '--bootstrap-server', kafka_bootstrap]
-         + (['--command-config', kafka_command_config] if kafka_command_config is defined else [])
-         + ['describe', '--status'] }}
-  register: kafka_status
-  changed_when: false
-  until: kafka_status.rc == 0 and kafka_status.stdout is search('(?m)^LeaderId:\s+[0-9]+\s*$')
+    argv: [systemctl, is-active, "{{ patch_role }}.service"]
+  register: active
+  until: active.rc == 0
   retries: 6
-  delay: 5
-  when: kafka_bootstrap is defined
+  delay: 3
+  changed_when: false
+
+- name: Verify role-specific platform health
+  ansible.builtin.include_tasks: "{{ patch_role }}.yml"

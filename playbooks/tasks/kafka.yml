@@ -1,0 +1,41 @@
+---
+- name: Read KRaft quorum status
+  ansible.builtin.command:
+    argv: "{{ ['timeout', '25', kafka_bin ~ '/kafka-metadata-quorum.sh'] + kafka_connection + ['describe', '--status'] }}"
+  changed_when: false
+  register: quorum
+  until: quorum.rc == 0 and quorum.stdout is search('(?m)^LeaderId:\s+[0-9]+\s*$') and quorum.stdout is search('(?m)^MaxFollowerLag:\s+0\s*$')
+  retries: 8
+  delay: 5
+
+- name: Match voter identities to the inventory
+  vars:
+    voters: "{{ (quorum.stdout_lines | select('match','^CurrentVoters:') | first).split(':',1)[1] | trim | from_json }}"
+    voter_ids: "{{ voters | map(attribute='id') | list if voters and voters[0] is mapping else voters }}"
+  ansible.builtin.assert:
+    that:
+      - (voter_ids | map('int') | sort) == (kafka_voters | map('int') | sort)
+      - (kafka_voters | length == 1) == (patch_topology == 'single_node')
+
+- name: Check Kafka partition availability and in-sync replicas
+  ansible.builtin.command:
+    argv: "{{ ['timeout', '30', kafka_bin ~ '/kafka-topics.sh'] + kafka_connection + ['--describe', item] }}"
+  loop: [--unavailable-partitions, --under-replicated-partitions, --under-min-isr-partitions]
+  register: partitions
+  until: partitions.rc == 0 and partitions.stdout | trim == ''
+  retries: 5
+  delay: 5
+  changed_when: false
+
+- name: Record the local Kafka distribution version
+  ansible.builtin.command:
+    argv: ["{{ kafka_bin }}/kafka-topics.sh", --version]
+  register: kafka_version_report
+  changed_when: false
+
+- name: Record Kafka quorum and partition results
+  ansible.builtin.set_fact:
+    role_evidence:
+      cli_version: "{{ kafka_version_report.stdout }}"
+      quorum: "{{ quorum.stdout_lines }}"
+      unavailable_or_under_replicated_or_below_min_isr: 0

@@ -1,93 +1,95 @@
 ---
-- name: Exercise the real patch recovery path on a fresh Lima lab
-  hosts: lab
+- name: Exercise a failed Redis host window while Kafka stays online
+  hosts: redis
   become: true
   vars:
     fixture: /etc/systemd/system/redis.service.d/90-forge-drill.conf
-    hold_path: /var/lib/playbook-forge-redis.hold
+    hold_path: /var/lib/playbook-forge-os.hold
   tasks:
-    - name: Confirm this is the disposable guest
+    - name: Verify both guests are the disposable lab
       ansible.builtin.slurp:
         src: /etc/playbook-forge-lab
-      register: marker
+      delegate_to: "{{ item }}"
+      loop: [lima-forge-redis, lima-forge-kafka]
+      register: markers
 
-    - name: Read the starting Redis build
-      ansible.builtin.command:
-        argv: [rpm, -q, --queryformat, "%{VERSION}-%{RELEASE}", redis]
-      register: starting
-      changed_when: false
-
-    - name: Check for an existing fixture or hold
+    - name: Check for an existing hold or fixture
       ansible.builtin.stat:
         path: "{{ item }}"
-      loop: "{{ [fixture, hold_path] }}"
+      loop: "{{ [hold_path, fixture] }}"
       register: paths
 
-    - name: Require a fresh lab at the old package version
+    - name: Require the lab inventory and a bootable baseline
       ansible.builtin.assert:
         that:
-          - marker.content | b64decode | trim == 'local-patching-pilot-v1'
-          - starting.stdout == redis_from
+          - groups['patch_targets'] == ['lima-forge-redis','lima-forge-kafka']
+          - markers.results | map(attribute='content') | map('b64decode') | map('trim') | unique | list == ['local-patching-pilot-v1']
+          - ansible_facts['kernel'] != patch_kernel
           - paths.results | selectattr('stat.exists') | list | length == 0
-          - ansible_play_hosts_all | length == 1
 
-    - name: Create the lab systemd override directory
+    - name: Record Kafka boot and package state before the failure
+      ansible.builtin.command: "{{ item }}"
+      loop: [cat /proc/sys/kernel/random/boot_id, rpm -q kernel-core]
+      delegate_to: lima-forge-kafka
+      register: kafka_before
+      changed_when: false
+
+    - name: Create a systemd drop-in directory for the drill
       ansible.builtin.file:
         path: /etc/systemd/system/redis.service.d
         state: directory
         mode: '0755'
 
-    - name: Run a change that fails to activate the target Redis binary
+    - name: Test the real two-host playbook and targeted recovery
       block:
-        - name: Make only the target version fail its systemd start check
+        - name: Prevent Redis startup under the approved target kernel
           ansible.builtin.copy:
             dest: "{{ fixture }}"
             mode: '0644'
             content: |
-              [Service]
-              ExecStartPre=/bin/sh -c '! /usr/bin/redis-server --version | /usr/bin/grep -Fq "v={{ redis_to.split("-")[0] }} "'
+              [Unit]
+              ConditionKernelVersion=!{{ patch_kernel }}
 
-        - name: Load the temporary start check
-          ansible.builtin.systemd_service:
-            daemon_reload: true
+        - name: Reload the fault fixture
+          ansible.builtin.systemd_service: {daemon_reload: true}
 
-        - name: Run the regular patch entry point from the Mac
+        - name: Run the ordinary window against both guests
           delegate_to: localhost
           become: false
           ansible.builtin.command:
-            argv:
-              - "{{ playbook_dir }}/../scripts/run-patch"
-              - -i
-              - "{{ inventory_file }}"
-              - --limit
-              - "{{ inventory_hostname }}"
-              - -e
-              - patch_apply=true
-              - -e
-              - patch_reboot=false
-          register: drill
-          failed_when: drill.rc != 2 or 'Group held for Engineer review.' not in drill.stdout
+            argv: ["{{ playbook_dir }}/../scripts/run-patch", -i, "{{ inventory_file }}", -e, patch_apply=true]
+          register: patch
+          failed_when: patch.rc != 2 or 'Maintenance held on lima-forge-redis' not in patch.stdout
 
-        - name: Verify the durable hold
+        - name: Verify that the failure happened after booting the approved kernel
+          ansible.builtin.command: uname -r
+          register: booted
+          changed_when: false
+          failed_when: booted.stdout != patch_kernel
+
+        - name: Require Kafka to retain its original boot ID and installed kernels
+          ansible.builtin.command: "{{ item.item }}"
+          delegate_to: lima-forge-kafka
+          loop: "{{ kafka_before.results }}"
+          loop_control: {label: "{{ item.item }}"}
+          register: kafka_after
+          failed_when: kafka_after.rc != 0 or kafka_after.stdout != item.stdout
+          changed_when: false
+
+        - name: Run the approved retained-kernel recovery on Redis alone
+          delegate_to: localhost
+          become: false
+          ansible.builtin.command:
+            argv: ["{{ playbook_dir }}/../scripts/run-patch", --recover, -i, "{{ inventory_file }}", --limit, "{{ inventory_hostname }}"]
+
+        - name: Check that the reviewed host stays held after recovery
           ansible.builtin.stat:
-            path: "{{ hold_path }}"
+            path: "{{ hold_path }}/window.json"
           register: held
-
-        - name: Require a held run
-          ansible.builtin.assert:
-            that: held.stat.isdir | default(false)
-
-        - name: Verify recovered services independently
-          ansible.builtin.import_tasks: ../playbooks/tasks/health.yml
-          vars:
-            expected_redis_version: "{{ redis_from.split('-')[0] }}"
-
+        - ansible.builtin.assert:
+            that: held.stat.isreg | default(false)
       always:
-        - name: Remove the lab fault
-          ansible.builtin.file:
-            path: "{{ fixture }}"
-            state: absent
-
-        - name: Reload normal systemd settings
-          ansible.builtin.systemd_service:
-            daemon_reload: true
+        - name: Remove the lab-only fixture
+          ansible.builtin.file: {path: "{{ fixture }}", state: absent}
+        - name: Restore the normal service definition
+          ansible.builtin.systemd_service: {daemon_reload: true}

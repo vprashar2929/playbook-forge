@@ -1,191 +1,258 @@
 ---
-- name: Patch the approved standalone Redis hosts one at a time
+- name: Run the approved OS patch window one host at a time
   hosts: patch_targets
+  become: true
   serial: 1
   any_errors_fatal: true
-  become: true
-  vars:
-    hold_path: /var/lib/playbook-forge-redis.hold
-    build_query: "%{VERSION}-%{RELEASE}.%{ARCH}"
-    host_arch: "{{ ansible_facts['architecture'] }}"
-    baseline_build: "{{ redis_from }}.{{ host_arch }}"
-    approved_build: "{{ redis_to }}.{{ host_arch }}"
+  vars_files: [vars/window.yml]
+  module_defaults:
+    scoped_dnf:
+      repositories: "{{ patch_repos }}"
+      advisories: "{{ patch_advisories }}"
+      targets: "{{ patch_targets_nevra }}"
   tasks:
-    - name: Check the host identity and approved change inputs
-      ansible.builtin.assert:
-        that:
-          - ansible_facts['hostname'] == expected_hostname
-          - ansible_facts['os_family'] == 'RedHat' and ansible_facts['distribution_major_version'] == '9'
-          - redis_from != redis_to
-          - redis_stage is match('^/')
-          - kafka_bootstrap is undefined or kafka_bin is defined
+    - name: Validate the scope and control path
+      ansible.builtin.import_tasks: tasks/identity.yml
 
-    - name: Check for an interrupted or held run
+    - name: Check for interrupted maintenance
       ansible.builtin.stat:
         path: "{{ hold_path }}"
       register: hold
 
-    - name: Require a reconciled starting state
+    - name: Require the previous window to be reconciled
       ansible.builtin.assert:
         that: not hold.stat.exists
-        fail_msg: "Host is held at {{ hold_path }}. Review the previous run and verify recovery before releasing it."
+        fail_msg: "Existing OS patch hold on {{ inventory_hostname }}. Inspect the recorded window before resuming."
 
-    - name: Read the installed Redis build
+    - name: Record the actual boot and kernel before changes
+      ansible.builtin.set_fact:
+        prior_kernel: "{{ initial_kernel.stdout }}"
+        backup_dir: "/var/backups/playbook-forge/{{ lookup('env','FORGE_WINDOW') | basename }}"
+
+    - name: Reject a requested kernel older than the running kernel
       ansible.builtin.command:
-        argv: [rpm, -q, --queryformat, "{{ build_query }}", redis]
-      register: installed
+        argv:
+          - /usr/bin/python3
+          - -c
+          - |
+            import rpm, sys
+            def evr(kernel):
+                version, release = kernel.rsplit(".", 1)[0].split("-", 1)
+                return ("0", version, release)
+            sys.exit(rpm.labelCompare(evr(sys.argv[1]), evr(sys.argv[2])) < 0)
+          - "{{ patch_kernel }}"
+          - "{{ prior_kernel }}"
       changed_when: false
 
-    - name: Accept only the approved baseline or target build
-      ansible.builtin.assert:
-        that: installed.stdout in [baseline_build, approved_build]
+    - name: Check the bootloader default
+      ansible.builtin.command: grubby --default-kernel
+      register: boot_default
+      changed_when: false
 
-    - name: Check whether the host already needs a reboot
+    - name: Check for outstanding host reboot
       ansible.builtin.command: needs-restarting -r
       register: reboot_hint
       changed_when: false
-      failed_when: reboot_hint.rc not in [0, 1]
+      environment: {LC_ALL: C}
+      failed_when: reboot_hint.rc not in [0,1] or (reboot_hint.rc == 1 and 'Reboot is required' not in reboot_hint.stdout)
 
-    - name: Hold an outstanding system reboot outside this package change
+    - name: Check free space on the boot, package and backup filesystems
+      ansible.builtin.command: df -m --output=avail /boot /usr /var
+      register: space
+      changed_when: false
+
+    - name: Require adequate space and a reconciled boot selection
       ansible.builtin.assert:
-        that: reboot_hint.rc == 0 or (installed.stdout == baseline_build and patch_reboot | default(false) | bool)
-        fail_msg: "The host reports an outstanding reboot. Review it before treating this patch window as complete."
+        that:
+          - (space.stdout_lines[1:] | map('trim') | map('int') | min) >= (patch_min_free_mib | default(256) | int)
+          - boot_default.stdout == '/boot/vmlinuz-' ~ prior_kernel
 
-    - name: Verify baseline platform health and running version
-      ansible.builtin.import_tasks: tasks/health.yml
+    - name: Inspect systemd and the platform before maintenance
+      ansible.builtin.import_tasks: tasks/units.yml
+
+    - name: Verify the service will start after reboot
+      ansible.builtin.command:
+        argv: [systemctl, is-enabled, "{{ patch_role }}.service"]
+      register: unit_enabled
+      changed_when: false
+      failed_when: unit_enabled.stdout != 'enabled'
+
+    - name: Verify the assigned role before maintenance
+      ansible.builtin.include_tasks: tasks/health.yml
+
+    - name: Preserve the platform baseline
+      ansible.builtin.set_fact:
+        baseline_health: "{{ role_evidence }}"
+        baseline_failed_units: "{{ failed_units.stdout_lines }}"
+
+    - name: Save the pre-change RPM inventory
+      ansible.builtin.include_tasks: tasks/snapshot.yml
+      vars: {snapshot_phase: before}
+
+    - name: Verify peer capacity, replication and maintenance order
+      ansible.builtin.include_tasks: "{{ inventory_dir }}/maintenance/{{ patch_role }}/precheck.yml"
+      when: patch_topology == 'cluster'
+
+    - name: Preview only advisories from the approved content view
+      scoped_dnf: {}
+      register: preview
+
+    - name: Decide whether the window needs a transaction or a reboot
+      ansible.builtin.set_fact:
+        needs_window: "{{ preview.plan.install | length > 0 or prior_kernel != patch_kernel or reboot_hint.rc == 1 }}"
+
+    - name: Record the starting state and package plan
+      ansible.builtin.include_tasks: tasks/evidence.yml
       vars:
-        expected_redis_version: "{{ installed.stdout.split('-')[0] }}"
+        outcome: "{{ 'ready' if needs_window else 'already current and healthy' }}"
 
-    - name: Measure free space on the package and state filesystems
-      ansible.builtin.command: df -m --output=avail /usr /var
-      register: free_space
-      changed_when: false
-
-    - name: Require space for the transaction and its recovery
-      ansible.builtin.assert:
-        that: (free_space.stdout_lines[1:] | map('trim') | map('int') | min) >= (patch_min_free_mib | default(256) | int)
-      when: installed.stdout != approved_build
-
-    - name: Check the RPMs needed for this change
-      ansible.builtin.include_tasks: tasks/check-rpm.yml
-      loop: "{{ [redis_to, redis_from] if patch_rollback_approved | default(false) | bool else [redis_to] }}"
-      loop_control:
-        loop_var: rpm_release
-      when: installed.stdout != approved_build
-
-    - name: Confirm the offline DNF transaction resolves
-      ansible.builtin.dnf:
-        name: "{{ redis_stage }}/redis-{{ approved_build }}.rpm"
-        state: present
-        disablerepo: '*'
-        install_weak_deps: false
-        update_cache: false
-      check_mode: true
-      changed_when: false
-      when: installed.stdout != approved_build
-
-    - name: Record readiness and intended action
-      ansible.builtin.debug:
-        msg:
-          host: "{{ inventory_hostname }}"
-          before: "{{ installed.stdout }}"
-          approved: "{{ approved_build }}"
-          decision: "{{ 'already current and healthy' if installed.stdout == approved_build else 'ready to patch' }}"
-
-    - name: Apply the approved change
-      when:
-        - patch_apply | default(false) | bool
-        - installed.stdout != approved_build
+    - name: Apply the approved host window
+      when: patch_apply | default(false) | bool and needs_window
       block:
-        - name: Acquire an exclusive host hold before making changes
+        - name: Take an exclusive host hold
           ansible.builtin.command:
             argv: [mkdir, -m, '0700', "{{ hold_path }}"]
 
-        - name: Recheck the starting build under the hold
+        - name: Mark progress before any disruptive action
+          ansible.builtin.include_tasks: tasks/evidence.yml
+          vars: {outcome: in progress - verify if interrupted}
+
+        - name: Save recovery context on the host
+          ansible.builtin.copy:
+            dest: "{{ hold_path }}/window.json"
+            mode: '0600'
+            content: "{{ {'host': inventory_hostname, 'role': patch_role, 'before': prior_kernel, 'target': patch_kernel, 'change': patch_change_id, 'backup': backup_dir} | to_nice_json }}"
+
+        - name: Stage and signature-check the exact resolved RPMs before service shutdown
+          scoped_dnf:
+            mode: stage
+            reviewed: "{{ preview.plan }}"
+
+        - name: Create a private configuration backup directory
+          ansible.builtin.file:
+            path: "{{ backup_dir }}"
+            state: directory
+            mode: '0700'
+
+        - name: Back up the configured service files
           ansible.builtin.command:
-            argv: [rpm, -q, --queryformat, "{{ build_query }}", redis]
-          register: locked_build
+            argv: "{{ ['tar','-cf',backup_dir ~ '/config.tar','-C','/','--'] + (config_paths | map('regex_replace','^/', '') | list) }}"
+
+        - name: Verify backup contents agree with the source files
+          ansible.builtin.command:
+            argv: [tar, -df, "{{ backup_dir }}/config.tar", -C, /]
           changed_when: false
-          failed_when: locked_build.rc != 0 or locked_build.stdout != baseline_build
 
-        - name: Install the approved staged Redis RPM offline
-          ansible.builtin.dnf:
-            name: "{{ redis_stage }}/redis-{{ approved_build }}.rpm"
-            state: present
-            disablerepo: '*'
-            install_weak_deps: false
+        - name: Record successful archive verification
+          ansible.builtin.set_fact: {backup_verified: true}
 
-        - name: Reboot and reconnect if the change requires it
-          ansible.builtin.reboot:
-            reboot_timeout: 240
-          when: patch_reboot | default(false) | bool
+        - name: Prepare the member for removal or perform approved planned failover
+          ansible.builtin.include_tasks: "{{ inventory_dir }}/maintenance/{{ patch_role }}/prepare.yml"
+          when: patch_topology == 'cluster'
 
-        - name: Activate and verify the patched service
-          block:
-            - name: Restart Redis when the host stayed up
-              ansible.builtin.systemd_service:
-                name: redis
-                state: restarted
-              when: not (patch_reboot | default(false) | bool)
+        - name: Stop the service and verify the shutdown
+          ansible.builtin.import_tasks: tasks/stop-service.yml
 
-            - name: Verify the installed build
-              ansible.builtin.command:
-                argv: [rpm, -q, --queryformat, "{{ build_query }}", redis]
-              register: after_install
-              changed_when: false
-              failed_when: after_install.rc != 0 or after_install.stdout != approved_build
+        - name: Verify surviving peers after the member stopped
+          ansible.builtin.include_tasks: "{{ inventory_dir }}/maintenance/{{ patch_role }}/peers_offline.yml"
+          when: patch_topology == 'cluster'
 
-            - name: Verify post-patch platform health
-              ansible.builtin.import_tasks: tasks/health.yml
-              vars:
-                expected_redis_version: "{{ redis_to.split('-')[0] }}"
+        - name: Apply the identical transaction from the staged content
+          scoped_dnf:
+            mode: apply
+            reviewed: "{{ preview.plan }}"
+          register: transaction
 
-          rescue:
-            - name: Require explicit approval for this exact rollback
-              ansible.builtin.assert:
-                that: patch_rollback_approved | default(false) | bool
-                fail_msg: "Verification failed. Host remains held for manual recovery."
-
-            - name: Confirm the target build is installed before reversing it
-              ansible.builtin.command:
-                argv: [rpm, -q, --queryformat, "{{ build_query }}", redis]
-              register: rollback_start
-              changed_when: false
-              failed_when: rollback_start.rc != 0 or rollback_start.stdout != approved_build
-
-            - name: Reinstall the approved prior Redis build offline
-              ansible.builtin.dnf:
-                name: "{{ redis_stage }}/redis-{{ baseline_build }}.rpm"
-                state: present
-                disablerepo: '*'
-                allow_downgrade: true
-                install_weak_deps: false
-
-            - name: Restart the restored Redis build
-              ansible.builtin.systemd_service:
-                name: redis
-                state: restarted
-
-            - name: Verify the exact recovered package
-              ansible.builtin.command:
-                argv: [rpm, -q, --queryformat, "{{ build_query }}", redis]
-              register: restored
-              changed_when: false
-              failed_when: restored.rc != 0 or restored.stdout != baseline_build
-
-            - name: Verify recovered platform health
-              ansible.builtin.import_tasks: tasks/health.yml
-              vars:
-                expected_redis_version: "{{ redis_from.split('-')[0] }}"
-
-            - name: Hold the group after a verified rollback
-              ansible.builtin.fail:
-                msg: "Rolled Redis back to {{ restored.stdout }} and verified platform health. Group held for Engineer review."
-
-        - name: Release the host only after successful verification
+        - name: Capture the exact DNF transaction before reboot
           ansible.builtin.command:
-            argv: [rmdir, "{{ hold_path }}"]
+            argv: [dnf, -C, --disablerepo=*, history, info, "{{ transaction.transaction_id }}"]
+          register: history
+          changed_when: false
+          when: transaction.transaction_id is not none
 
-        - name: Record the completed change
-          ansible.builtin.debug:
-            msg: "Verified {{ inventory_hostname }} at Redis {{ after_install.stdout }}; platform checks passed."
+        - name: Save transaction evidence off the host
+          ansible.builtin.include_tasks: tasks/evidence.yml
+          vars: {outcome: packages verified - awaiting boot and platform checks}
+
+        - name: Verify target and previous boot entries exist
+          ansible.builtin.command:
+            argv: [grubby, "--info=/boot/vmlinuz-{{ item }}"]
+          loop: "{{ [prior_kernel, patch_kernel] | unique }}"
+          changed_when: false
+
+        - name: Check whether the installed change requires a reboot
+          ansible.builtin.command: needs-restarting -r
+          environment: {LC_ALL: C}
+          register: after_hint
+          changed_when: false
+          failed_when: after_hint.rc not in [0,1] or (after_hint.rc == 1 and 'Reboot is required' not in after_hint.stdout)
+
+        - name: Decide whether to reboot or restore only the stopped service
+          ansible.builtin.set_fact:
+            reboot_required: "{{ prior_kernel != patch_kernel or after_hint.rc == 1 or patch_force_reboot | default(false) | bool }}"
+
+        - name: Select the approved kernel for the next boot
+          ansible.builtin.command:
+            argv: [grubby, --set-default, "/boot/vmlinuz-{{ patch_kernel }}"]
+          when: prior_kernel != patch_kernel
+
+        - name: Reboot the guest and reconnect
+          ansible.builtin.reboot:
+            reboot_timeout: "{{ patch_reboot_timeout | default(300) }}"
+
+          when: reboot_required
+
+        - name: Restore the service when a host reboot is unnecessary
+          ansible.builtin.systemd_service:
+            name: "{{ patch_role }}"
+            state: started
+          when: not reboot_required
+
+        - name: Verify the running kernel after maintenance
+          ansible.builtin.command: uname -r
+          register: booted
+          changed_when: false
+          failed_when: booted.stdout != patch_kernel
+
+        - name: Record the observed kernel
+          ansible.builtin.set_fact: {observed_kernel: "{{ booted.stdout }}"}
+
+        - name: Recheck RPM targets and remaining advisory work
+          scoped_dnf: {}
+          register: remaining
+
+        - name: Require all approved package builds and no remaining updates
+          ansible.builtin.assert:
+            that: remaining.plan.install | length == 0 and (remaining.installed | sort) == (patch_targets_nevra | sort)
+
+        - name: Verify platform recovery across the observation interval
+          ansible.builtin.include_tasks: tasks/steady.yml
+
+        - name: Verify cluster rejoin and restore intended membership
+          ansible.builtin.include_tasks: "{{ inventory_dir }}/maintenance/{{ patch_role }}/returned.yml"
+          when: patch_topology == 'cluster'
+
+        - name: Verify the host needs no further reboot
+          ansible.builtin.command: needs-restarting -r
+          changed_when: false
+
+        - name: Save the post-change RPM inventory
+          ansible.builtin.include_tasks: tasks/snapshot.yml
+          vars: {snapshot_phase: after}
+
+        - name: Release the hold after verification
+          ansible.builtin.file:
+            path: "{{ hold_path }}"
+            state: absent
+
+        - name: Record the completed window
+          ansible.builtin.include_tasks: tasks/evidence.yml
+          vars: {outcome: patched and verified}
+      rescue:
+        - name: Record the failed step on the controller
+          ansible.builtin.include_tasks: tasks/evidence.yml
+          vars:
+            outcome: "held - {{ ansible_failed_task.name }}"
+        - name: Stop the selected group for Engineer review
+          ansible.builtin.fail:
+            msg: "Maintenance held on {{ inventory_hostname }}. Reconcile the host and controller evidence before retrying."

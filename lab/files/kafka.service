@@ -8,6 +8,7 @@ Group=kafka
 Environment=LOG_DIR=/var/log/kafka
 Environment="KAFKA_HEAP_OPTS=-Xms256m -Xmx512m"
 ExecStart=/opt/kafka/bin/kafka-server-start.sh /etc/kafka/server.properties
+SuccessExitStatus=143
 Restart=on-failure
 
 [Install]

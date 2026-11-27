@@ -1,0 +1,18 @@
+---
+- name: Verify recovery before the observation interval
+  ansible.builtin.include_tasks: health.yml
+
+- name: Wait for the configured observation interval
+  ansible.builtin.wait_for:
+    timeout: "{{ patch_health_interval | default(30) }}"
+
+- name: Recheck health after the observation interval
+  ansible.builtin.include_tasks: health.yml
+
+- name: Verify the host has no unexpected failed units
+  ansible.builtin.import_tasks: units.yml
+
+- name: Capture the boot identity after maintenance
+  ansible.builtin.command: cat /proc/sys/kernel/random/boot_id
+  register: final_boot
+  changed_when: false

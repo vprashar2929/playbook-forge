@@ -1,12 +1,10 @@
 # playbook-forge
 
-Ansible playbooks and lab environments for designing, testing, and refining infrastructure automation.
+This pilot rehearses an approved Enterprise Linux 9 **OS patch window**. The Mac runs Ansible over SSH to two dedicated Rocky Linux VMs. One hosts Redis and the other hosts a Kafka broker/controller. The playbook patches the operating system on one host at a time, verifies the running kernel and waits for that host's platform to recover.
 
-The first pilot runs a real offline Redis RPM upgrade on a Rocky Linux 9 VM. Redis and a single-node Kafka KRaft broker run as systemd services. The Engineer launches the patch from the Mac. The playbook checks the host, installs the approved RPM, optionally reboots, and waits for both services to recover. The same patch entry point accepts a Dev/Test inventory.
+## Run the lab
 
-## Start the lab on macOS
-
-Install Lima 2.x and Python 3.12. With Homebrew, run `brew install lima python@3.12`. Run the following from the checkout.
+Install Lima 2.x and Python 3.12 on macOS (`brew install lima python@3.12`). Run the following from the checkout.
 
 ```sh
 make lab
@@ -16,59 +14,67 @@ make patch
 make stop
 ```
 
-- `make lab` creates a project-local Python environment and a Lima VM called `forge-lab` with two CPUs, 4 GiB RAM and a 25 GiB virtual disk. Ansible installs standalone Redis 6.2.22, Kafka 4.4.0 and Java 21. Setup downloads public artifacts, stages both Redis RPMs in the guest and verifies their checksums. Reserve this VM name for the lab.
-- `make ready` checks identity, package and running versions, platform health, free space, approved RPM digests and offline transaction resolution. The default patch entry point runs this read-only assessment.
-- `make patch` upgrades Redis to 6.2.24 from the staged RPM with all DNF repositories disabled. The lab inventory requests a guest reboot. Ansible verifies the exact package, the running Redis version and a Kafka metadata leader. The second run should report `changed=0`.
-- `make stop` releases the VM's memory and preserves its disk. A later `make lab` starts it and preserves the installed Redis version. To reset a disposable lab to the original baseline, stop it, run `limactl delete forge-lab` to erase its disk, then run `make lab`. To inspect either service, use `limactl shell forge-lab` and run `systemctl status redis kafka`.
+`make lab` creates `forge-redis` and `forge-kafka` (two CPUs and 3 GiB default memory each). It builds a local DNF repository on each guest from vendor-signed kernel RPMs and gives the package set a **synthetic lab advisory**. The lab uses the distribution's Redis package and pins Kafka 3.9.1. It uses a loopback plaintext Kafka listener; the private inventory supplies client-side TLS/SASL settings where required. Initial setup uses the internet. The window uses only this guest-local repository. Lima provides SSH, and the services listen on guest loopback. Earlier one-VM checkouts used `forge-lab`; the new targets are independent of it.
 
-The lab uses Lima's generated SSH configuration. The Mac's home directory is unmounted and the guest services listen locally. The initial downloads require internet access. The patch and rollback transactions use guest-local RPMs. Each patch invocation writes a separate controller log under `.run/`, including failed and unreachable tasks.
+`make ready` runs the same prechecks and DNF solver used for patching. `make patch` applies the approved transaction. The repeat run should report both hosts already current and healthy. `make stop` preserves the VM disks. To reset a disposable lab, stop the VMs, delete each with `limactl delete NAME`, then run `make lab`.
 
-## Exercise rollback
+## What the Engineer's patch run does
 
-On a freshly provisioned lab **before the first successful patch**, run the drill.
+| Manual step | Playbook behavior |
+| --- | --- |
+| Confirm host, role and scope | Match hostname, EL9, service role and topology. Match the inventory IP when supplied (required in cluster mode). Require a change ID, recovery reference, advisory list, approved repositories and exact target package builds. |
+| Establish a baseline | Capture running/default kernel, boot ID, RPM inventory, failed units, free space and role health. Redis checks liveness, replication, persistence and key count. Kafka checks the expected KRaft voters, leader, follower lag, unavailable partitions, under-replicated partitions and partitions below minimum ISR. |
+| Preview, review and stage | Resolve the advisory-filtered DNF4 upgrade against the approved content. Compare every incoming build with the approved missing builds. Reject unexpected package operations, keep old kernels and stage and signature-check RPMs before stopping a service. A separate readiness run exposes the proposed transaction for change review. |
+| Prepare and patch | Acquire a persistent host hold. Archive and compare the inventory-listed configuration files. Run topology-specific maintenance preparation where applicable. Stop only the assigned service and require a clean stop. Kafka exit 143 additionally requires a graceful completion message in this stop’s journal and no fatal error or timeout. Recheck the cached transaction, install and record its DNF history ID. |
+| Reboot and verify | Check old and new boot entries, select the approved kernel, reboot and reconnect when required. A package-only change that needs no reboot restarts the stopped service. Set `patch_force_reboot` if an active change window explicitly calls for reboot. Verify `uname -r`, installed targets, zero remaining scoped work, automatic service startup, failed units and reboot status. Sample role health twice across the observation interval before advancing. |
+| Close out | Save per-host before/after evidence and a controller summary. An unreachable or unvisited host stays unverified. A failed or interrupted change holds the rollout for the Engineer. Authenticated rescanning is a separate verification step. |
+
+The lab intentionally permits an outage of each single instance. Host separation demonstrates that maintenance on Redis can stop before Kafka changes. Zero-downtime failover requires peers.
+
+## Rehearse recovery
+
+On a baseline Redis guest, run `make rollback-drill` **before** the first successful patch. The drill prevents Redis from starting under the target kernel, invokes the real two-host patch run and verifies that Kafka retained both its boot ID and installed kernel list. It runs the single-host recovery playbook and removes the test fault. The recovered host stays held.
+
+The recovery play requires a reachable, explicitly approved single-node host, a matching held change, the target kernel currently running and a distinct retained previous boot entry. It boots the previous kernel and repeats platform checks. Installed RPMs, service data and configuration have separate recovery procedures. An uncertain transaction, inaccessible host or cluster recovery requires reconciliation over the management console.
+
+After reviewing the lab evidence, check the running kernel and Redis, then archive the hold before retrying.
 
 ```sh
-make rollback-drill
-```
-
-The drill installs a temporary systemd start check which rejects only the target Redis version. It invokes the regular patch playbook, confirms the old version is serving again, verifies Kafka, and removes the temporary fault. The patch run returns failure by design and leaves a durable host hold. The drill succeeds only when it observes the expected recovery and hold. A subsequent patch attempt must stop at that hold.
-
-Review the controller log and verify the guest before releasing the lab hold.
-
-```sh
-limactl shell forge-lab -- rpm -q redis
-limactl shell forge-lab -- redis-cli ping
-limactl shell forge-lab -- sudo rmdir /var/lib/playbook-forge-redis.hold
+limactl shell forge-redis -- uname -r
+limactl shell forge-redis -- redis-cli ping
+limactl shell forge-redis -- sudo mv -T /var/lib/playbook-forge-os.hold "/var/backups/playbook-forge/reviewed-$(date +%s)"
 make patch
 ```
 
-A failed or interrupted RPM install, failed reboot, unreachable host or unverified rollback requires Engineer review. On a held host, use its console and the controller log to reconcile the installed build and platform state before retrying. An approved package rollback restores the earlier binary. Data and configuration recovery require their own tested procedures.
+## Run against an existing Dev/Test inventory
 
-## Use the patch playbook in Dev/Test
-
-Run `make tools` on the control node (Python 3.12–3.14). The lab setup and rollback drill are specific to the marked disposable VM. To patch an existing host, pass its inventory to the patch entry point.
+Keep client inventory, credentials, topology procedures and real advisory manifests outside this public repository. Use `make tools` to install the pinned controller environment (Python 3.12–3.14). On a disconnected control node, install the pinned Python dependency from your internal package mirror or wheelhouse. Only lab creation uses Lima. The existing Dev/Test hosts need system Python with DNF4/RPM bindings, grubby, needs-restarting, platform CLIs, persistent SSH access through reboot and approved privilege escalation.
 
 ```sh
-./scripts/run-patch -i /path/to/dev/hosts.yml --limit redis-dev-01
-./scripts/run-patch -i /path/to/dev/hosts.yml --limit redis-dev-01 -e patch_apply=true
+./scripts/run-patch -i /path/to/dev/hosts.yml --limit approved_group
+./scripts/run-patch -i /path/to/dev/hosts.yml --limit approved_group -e patch_apply=true
+./scripts/run-patch --recover -i /path/to/dev/hosts.yml --limit one_held_host
 ```
 
-Create a `patch_targets` inventory group. Start with a single standalone EL9 Redis host using DNF, `needs-restarting`, systemd and a working Ansible SSH and privilege-escalation path through reboot. Set the following in your private inventory, using [the lab variables](inventories/lab/group_vars/all.yml) as an example.
+Define `patch_targets` with role groups `redis` and `kafka`. Use [the synthetic lab inputs](inventories/lab/group_vars/all.yml) as the inventory contract. Set `patch_repos` to the approved, published content-view repository IDs, `patch_advisories` to that host's findings, and `patch_targets_nevra` and `patch_kernel` to the reviewed builds. Nonzero epochs use `name-epoch:version-release.arch`. Supply a frozen repository view and pre-enrolled signing keys. The package resolver rejects any dependency outside the approved builds; review and add a legitimate dependency to the manifest before proceeding. A private snapshot/restore record belongs in `recovery_reference`. The playbook makes a configuration archive on the host; arrange an independent backup and console through the site's existing process.
 
-| Variable | What to supply |
-| --- | --- |
-| `expected_hostname` | The short hostname reported by the guest. |
-| `redis_stage`, `redis_from`, `redis_to` | Root-controlled staging directory and the approved starting and target RPM version-release strings. Prestage `redis-<version-release>.<architecture>.rpm` under its expected filename. Provision dependencies and trusted package-signing keys through your usual process. |
-| `redis_checksums` | SHA-256 digests from the approved source, keyed by architecture and version-release. |
-| `patch_reboot` | Whether this change calls for a host reboot. Default is a Redis service restart. An outstanding host reboot outside the change holds the run. |
-| `patch_rollback_approved` | Defaults to false. Enable only after testing this exact downgrade against your persistence format, configuration and data, and staging the prior RPM. |
-| `redis_cli_args`, `redis_password` | Optional host, port, TLS and ACL arguments for the local Redis CLI. Supply passwords separately through Ansible Vault or the environment's secrets mechanism. |
-| `kafka_bootstrap`, `kafka_bin`, `kafka_command_config` | Configure the colocated KRaft broker's endpoint and CLI directory to enable Kafka verification. An optional guest-side client properties file supplies TLS or SASL settings. |
+Set `patch_role`, `expected_hostname`, `config_paths`, `patch_change_id` and `patch_topology` per host or group. Use `redis_cli_args` for the local Redis listener/TLS/ACL and a vaulted `redis_password` if required. Set `kafka_bin`, `kafka_bootstrap`, `kafka_voters` and optional persistent guest-side `kafka_command_config` for the actual listener and credentials. Set `allowed_failed_units` only for reviewed exceptions. One designated control node and one window per service group are required; the runner serializes windows within the checkout.
 
-The pilot updates the Redis RPM. Kafka is a second platform health check. The Redis role check requires a standalone primary with zero replicas. A replication group, Redis Cluster, or Kafka binary upgrade needs its own topology checks, sequencing and recovery tests before onboarding. The lab versions are synthetic fixtures. Set Dev/Test builds and approvals independently.
+### Clustered Dev/Test
 
-Hosts run one at a time. A failure stops the selected group. An exclusive host hold prevents overlapping changes to that host and survives a lost connection. Schedule one change window per service group. Keep credentials, real inventories and run logs outside the public repository.
+A hostname list establishes service placement. It cannot establish a Redis primary/replica relationship, Kafka voting membership, or acceptable write interruption. Set `patch_topology: cluster` for a real Redis Cluster or multi-voter KRaft deployment. Supply the site's reviewed Ansible tasks under `maintenance/<role>/` beside the private inventory. Readiness runs the peer precheck. Apply requires all four files before maintenance. These are site integration points; validation in this repository exercises the single-node branches.
 
-## Contribute
+| Phase file | Redis Cluster | Kafka KRaft |
+| --- | --- | --- |
+| `precheck.yml` | Query the actual primary and replicas. Check slot coverage, offsets, links, persistence and minimum replicas for writes. Select replicas first. | Verify broker membership, voter majority, replica availability and the impact of single-replica or at-minimum-ISR topics. |
+| `prepare.yml` | For an approved primary change, perform planned failover on the synchronized replica. Verify the exact role exchange and accepted write impact before stopping the target. | Confirm other brokers can serve and that controller majority survives this specific stop. |
+| `peers_offline.yml` | Check the surviving primary and write availability from a peer while the target is down. | From a surviving endpoint, verify controller election and the expected in-service replicas. |
+| `returned.yml` | Verify the expected role and upstream, synchronization, minimum healthy replicas, all slots and stable peer membership. | Verify the specific broker rejoined, replicas caught up and the expected quorum and ISR recovered. |
 
-[Lab setup](lab/setup.yml) owns provisioning. [Patching](playbooks/patch.yml) owns the change transaction. [Health checks](playbooks/tasks/health.yml) are used before and after the change and after recovery. For a change to the transaction, exercise a clean patch, a second run and the [rollback drill](lab/rollback-drill.yml) and include their results in the pull request.
+The two-VM lab does not authorize a client change. A separate client-side readiness run must establish the real access path, topology and approved contents. Independent service groups can be selected with `--limit`; the first failure stops the selected window.
+
+## Evidence and contributions
+
+Each invocation prints its private `.run/window-…` directory. It contains the selected host list, Ansible log, per-host outcome, RPM inventories, consolidated `summary.json` and a `SHA256SUMS` manifest. Keep this evidence on storage accessible to the Engineer independently of the patched hosts.
+
+[Lab provisioning](lab/setup.yml), [OS patching](playbooks/patch.yml), [kernel recovery](playbooks/recover.yml) and [the failure drill](lab/rollback-drill.yml) are separate entry points. Exercise the lab readiness, failure, recovery, normal patch and repeat-run paths when changing the patch transaction.

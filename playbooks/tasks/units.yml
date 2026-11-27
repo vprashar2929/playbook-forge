@@ -1,0 +1,9 @@
+---
+- name: Inspect failed systemd units
+  ansible.builtin.command: systemctl --failed --no-legend --plain --no-pager
+  register: failed_units
+  changed_when: false
+
+- name: Hold on failed units outside the reviewed exceptions
+  ansible.builtin.assert:
+    that: (failed_units.stdout_lines | map('split') | map('first') | difference(allowed_failed_units | default([]))) | length == 0

@@ -2,7 +2,7 @@ PYTHON ?= python3.12
 VENV := .venv
 PLAY := $(VENV)/bin/ansible-playbook
 LAB := -i inventories/lab/hosts.yml
-INSTANCE := forge-lab
+INSTANCES := forge-redis forge-kafka
 
 .PHONY: tools lab ready patch rollback-drill stop
 tools: $(VENV)/.installed
@@ -13,11 +13,10 @@ $(VENV)/.installed: requirements.txt
 	touch $@
 
 lab: tools
-	@if limactl list --format '{{.Name}}' | grep -Fxq $(INSTANCE); then \
-		limactl start -y $(INSTANCE); \
-	else \
-		limactl start -y --name=$(INSTANCE) ./lab/lima.yaml; \
-	fi
+	@set -e; for vm in $(INSTANCES); do \
+		if limactl list --format '{{.Name}}' | grep -Fxq "$$vm"; then limactl start -y "$$vm"; \
+		else limactl start -y --name="$$vm" ./lab/lima.yaml; fi; \
+	done
 	$(PLAY) $(LAB) lab/setup.yml
 
 ready: tools
@@ -30,4 +29,4 @@ rollback-drill: tools
 	$(PLAY) $(LAB) lab/rollback-drill.yml
 
 stop:
-	limactl stop $(INSTANCE)
+	@set -e; for vm in $(INSTANCES); do limactl stop "$$vm"; done

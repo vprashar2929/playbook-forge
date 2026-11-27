@@ -1,0 +1,43 @@
+---
+- name: Record the start of this shutdown for journal correlation
+  ansible.builtin.command: date +%s.%6N
+  register: stop_start
+  changed_when: false
+
+- name: Stop only the service on this host
+  ansible.builtin.systemd_service:
+    name: "{{ patch_role }}"
+    state: stopped
+
+- name: Inspect the service process and systemd stop result
+  ansible.builtin.command:
+    argv: [systemctl, show, "{{ patch_role }}", -p, MainPID, -p, ActiveState, -p, Result, -p, ExecMainStatus]
+  register: stopped
+  changed_when: false
+
+- name: Require a terminated process and a recognized stop result
+  ansible.builtin.assert:
+    that:
+      - "'MainPID=0' in stopped.stdout_lines"
+      - >-
+        ('ActiveState=inactive' in stopped.stdout_lines and 'Result=success' in stopped.stdout_lines)
+        or (patch_role == 'kafka' and 'ActiveState=failed' in stopped.stdout_lines
+        and 'Result=exit-code' in stopped.stdout_lines and 'ExecMainStatus=143' in stopped.stdout_lines)
+
+- name: Verify Kafka exit 143 against this shutdown's journal
+  when: "'Result=exit-code' in stopped.stdout_lines"
+  block:
+    - name: Read shutdown messages for this window
+      ansible.builtin.command:
+        argv: [journalctl, --no-pager, -o, cat, -u, kafka.service, "--since=@{{ stop_start.stdout }}"]
+      register: shutdown_log
+      changed_when: false
+
+    - name: Require graceful completion without a fatal error or timeout
+      ansible.builtin.assert:
+        that:
+          - shutdown_log.stdout is search('(?i)graceful shutdown completed')
+          - shutdown_log.stdout is not search('(?i)fatal|timed out|failed to (stop|shut down)')
+
+    - name: Clear the verified Kafka shutdown status
+      ansible.builtin.command: systemctl reset-failed kafka.service

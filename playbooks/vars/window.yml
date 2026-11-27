@@ -1,0 +1,3 @@
+---
+hold_path: /var/lib/playbook-forge-os.hold
+kafka_connection: "{{ ['--bootstrap-server', kafka_bootstrap] + (['--command-config', kafka_command_config] if kafka_command_config is defined else []) }}"

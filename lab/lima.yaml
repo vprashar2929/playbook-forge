@@ -1,6 +1,6 @@
 vmType: vz
 cpus: 2
-memory: 4GiB
+memory: 3GiB
 disk: 25GiB
 images:
   - location: https://dl.rockylinux.org/pub/rocky/9.9/images/aarch64/Rocky-9-GenericCloud-Base-9.9-20261112.0.aarch64.qcow2
