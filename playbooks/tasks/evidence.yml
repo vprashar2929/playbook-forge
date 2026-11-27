@@ -1,0 +1,19 @@
+---
+- name: Save the host outcome on the control node
+  delegate_to: localhost
+  become: false
+  ansible.builtin.copy:
+    dest: "{{ lookup('env', 'FORGE_WINDOW') }}/host-{{ inventory_hostname | hash('sha256') }}.json"
+    mode: '0600'
+    content: >-
+      {{ {'host': inventory_hostname, 'change': patch_change_id, 'outcome': outcome,
+          'hostname': ansible_facts['hostname'], 'addresses': ansible_facts['all_ipv4_addresses'],
+          'boot_id_before': initial_boot.stdout, 'boot_id_after': final_boot.stdout | default(none), 'recovery_reference': recovery_reference,
+          'role': patch_role, 'advisories': patch_advisories, 'expected_packages': patch_targets_nevra,
+          'kernel_before': prior_kernel, 'kernel_observed': observed_kernel | default(prior_kernel),
+          'plan': preview.plan | default({}), 'transaction_id': transaction.transaction_id | default(none),
+          'history': history.stdout | default(''), 'service_stop': stopped.stdout_lines | default([]), 'backup': backup_dir | default('') if backup_verified | default(false) else none,
+          'failed_units': failed_units.stdout_lines | default([]), 'before_failed_units': baseline_failed_units | default([]),
+          'before_health': baseline_health | default({}), 'last_health': role_evidence | default({}),
+          'rescan': 'pending independent authenticated scan'} | to_nice_json }}
+  changed_when: false

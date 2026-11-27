@@ -1,0 +1,80 @@
+---
+- name: Prepare the disposable Redis and Kafka lab
+  hosts: lab
+  become: true
+  any_errors_fatal: true
+  vars_files: [../playbooks/vars/window.yml]
+  vars:
+    kafka_version: 3.9.1
+    kafka_dir: "/opt/kafka_2.13-{{ kafka_version }}"
+    kafka_archive: "kafka_2.13-{{ kafka_version }}.tgz"
+    kafka_sha512: 1ea204ba73411737a275429ca976d440f007ff0957b90b19be41dc5a4bae52617267769be9f0b5791714d0b3c4c760605bd426faea39edd90763585523fa2cfe
+  tasks:
+    - name: Read the identity marker supplied by the Lima template
+      ansible.builtin.slurp:
+        src: /etc/playbook-forge-lab
+      register: lab_marker
+
+    - name: Confirm the intended disposable guest
+      ansible.builtin.assert:
+        that:
+          - lab_marker.content | b64decode | trim == 'local-patching-pilot-v1'
+          - ansible_facts['hostname'] == expected_hostname
+          - ansible_facts['distribution'] == 'Rocky'
+          - ansible_facts['distribution_major_version'] == '9'
+
+    - name: Trust the Rocky signing key shipped in the pinned image
+      ansible.builtin.rpm_key:
+        key: /etc/pki/rpm-gpg/RPM-GPG-KEY-Rocky-9
+
+    - name: Install lab repository and patch prerequisites
+      ansible.builtin.dnf:
+        name: [createrepo_c, dnf-plugins-core, grubby]
+
+    - name: Build a small signed-package repository with advisory metadata
+      ansible.builtin.import_tasks: repository.yml
+
+    - name: Install Redis on its dedicated host
+      ansible.builtin.dnf:
+        name: redis
+      when: patch_role == 'redis'
+
+    - name: Install the Kafka JVM
+      ansible.builtin.dnf:
+        name: java-17-openjdk-headless
+      when: patch_role == 'kafka'
+
+    - name: Provision the Kafka broker
+      ansible.builtin.include_tasks: kafka.yml
+      when: patch_role == 'kafka'
+
+    - name: Apply pending unit changes
+      ansible.builtin.meta: flush_handlers
+
+    - name: Enable the assigned platform service across reboots
+      ansible.builtin.systemd_service:
+        name: "{{ patch_role }}"
+        state: started
+        enabled: true
+    - name: List topics on the dedicated lab broker
+      ansible.builtin.command: /opt/kafka/bin/kafka-topics.sh --bootstrap-server 127.0.0.1:9092 --list
+      register: topics
+      until: topics.rc == 0
+      retries: 6
+      delay: 3
+      changed_when: false
+      when: patch_role == 'kafka'
+
+    - name: Create a lab partition to exercise the Kafka health checks
+      ansible.builtin.command: /opt/kafka/bin/kafka-topics.sh --bootstrap-server 127.0.0.1:9092 --create --if-not-exists --topic forge-pilot --partitions 1 --replication-factor 1
+      when: patch_role == 'kafka' and 'forge-pilot' not in topics.stdout_lines
+
+    - name: Verify the assigned service after provisioning
+      ansible.builtin.include_tasks: ../playbooks/tasks/health.yml
+
+  handlers:
+    - name: Restart Kafka
+      ansible.builtin.systemd_service:
+        name: kafka
+        daemon_reload: true
+        state: restarted

@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<updates>
+ <update from="forge" status="stable" type="security" version="1">
+  <id>{{ patch_advisories[0] }}</id><title>Local kernel patch exercise</title>
+  <issued date="2026-11-27 00:00:00"/><updated date="2026-11-27 00:00:00"/>
+  <description>Synthetic scope for the lab kernel transaction.</description>
+  <pkglist><collection short="forge-lab"><name>Lab OS</name>
+{% for name in kernel_packages %}
+   <package name="{{ name }}" version="{{ kernel_build.split('-')[0] }}" release="{{ kernel_build.split('-')[1] }}" arch="{{ ansible_facts['architecture'] }}" epoch="0">
+    <filename>{{ name }}-{{ patch_kernel }}.rpm</filename>
+   </package>
+{% endfor %}
+  </collection></pkglist>
+ </update>
+</updates>

@@ -1,0 +1,16 @@
+ansible_python_interpreter: /usr/bin/python3
+patch_topology: single_node
+single_node_outage_approved: true
+kernel_build: 5.14.0-741.27.1.el9_9
+kernel_packages: [kernel, kernel-core, kernel-modules, kernel-modules-core]
+patch_targets_nevra: "{{ kernel_packages | map('regex_replace', '$', '-' ~ kernel_build ~ '.' ~ ansible_facts['architecture']) | list }}"
+patch_kernel: "{{ kernel_build }}.{{ ansible_facts['architecture'] }}"
+patch_repos: [forge-lab]
+patch_advisories: ['FORGE-2026:0001']
+patch_health_interval: 5
+kernel_recovery_approved: true
+kafka_bin: /opt/kafka/bin
+kafka_bootstrap: 127.0.0.1:9092
+kafka_voters: [1]
+patch_change_id: lab-os-pilot
+recovery_reference: Disposable lab with retained bootable previous kernel

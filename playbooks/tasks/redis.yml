@@ -1,0 +1,34 @@
+---
+- name: Inspect local Redis liveness, replication, persistence and key count
+  ansible.builtin.command:
+    argv: "{{ ['redis-cli', '--raw'] + (redis_cli_args | default([])) + item }}"
+  loop: "{{ [['PING'], ['INFO'], ['DBSIZE']] + ([['CLUSTER', 'INFO']] if patch_topology == 'cluster' else []) }}"
+  environment: "{{ {'REDISCLI_AUTH': redis_password} if redis_password is defined else {} }}"
+  no_log: "{{ redis_password is defined }}"
+  register: redis
+  changed_when: false
+
+- name: Identify the local Redis service process
+  ansible.builtin.command: systemctl show redis --property=MainPID --value
+  register: redis_pid
+  changed_when: false
+
+- name: Match live Redis state to the declared topology
+  vars:
+    info: "{{ redis.results[1].stdout_lines }}"
+  ansible.builtin.assert:
+    that:
+      - redis_pid.stdout | int > 0 and ('process_id:' ~ redis_pid.stdout) in info
+      - redis.results[0].stdout | trim == 'PONG'
+      - redis.results[2].stdout | trim is match('^[0-9]+$')
+      - "'loading:0' in info and 'rdb_last_bgsave_status:ok' in info and 'rdb_bgsave_in_progress:0' in info"
+      - "'aof_enabled:0' in info or ('aof_last_write_status:ok' in info and 'aof_rewrite_in_progress:0' in info)"
+      - patch_topology != 'single_node' or ('role:master' in info and 'cluster_enabled:0' in info and 'connected_slaves:0' in info)
+      - patch_topology != 'cluster' or ('cluster_enabled:1' in info and 'cluster_state:ok' in redis.results[3].stdout_lines and 'cluster_slots_ok:16384' in redis.results[3].stdout_lines)
+      - "'role:slave' not in info or ('master_link_status:up' in info and 'master_sync_in_progress:0' in info)"
+
+- name: Record Redis role, persistence and key count
+  ansible.builtin.set_fact:
+    role_evidence:
+      replication: "{{ redis.results[1].stdout_lines | select('match', '^(redis_version|role|connected_slaves|master_link_status|master_sync_in_progress|aof_enabled|rdb_last_bgsave_status):') | list }}"
+      keys: "{{ redis.results[2].stdout }}"

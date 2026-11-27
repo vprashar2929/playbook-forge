@@ -1,0 +1,12 @@
+---
+- name: Verify the assigned systemd service
+  ansible.builtin.command:
+    argv: [systemctl, is-active, "{{ patch_role }}.service"]
+  register: active
+  until: active.rc == 0
+  retries: 6
+  delay: 3
+  changed_when: false
+
+- name: Verify role-specific platform health
+  ansible.builtin.include_tasks: "{{ patch_role }}.yml"

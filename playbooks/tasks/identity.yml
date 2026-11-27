@@ -1,0 +1,36 @@
+---
+- name: Match identity, role, topology and explicit change inputs
+  ansible.builtin.assert:
+    that:
+      - lookup('env','FORGE_WINDOW') | length > 0
+      - ansible_facts['hostname'] == expected_hostname
+      - patch_topology != 'cluster' or expected_ip is defined
+      - expected_ip is undefined or expected_ip in ansible_facts['all_ipv4_addresses']
+      - ansible_facts['os_family'] == 'RedHat' and ansible_facts['distribution_major_version'] == '9'
+      - patch_role in ['redis','kafka'] and inventory_hostname in groups[patch_role]
+      - (group_names | intersect(['redis','kafka']) | length) == 1
+      - patch_topology in ['single_node','cluster']
+      - patch_change_id | length > 0 and recovery_reference | length > 0
+      - patch_repos | length > 0 and patch_advisories | length > 0 and patch_targets_nevra | length > 0
+      - patch_kernel is match('^[0-9][a-zA-Z0-9._+-]+$')
+      - ('kernel-core-' ~ patch_kernel) in patch_targets_nevra
+      - patch_topology != 'single_node' or single_node_outage_approved | default(false) | bool
+      - config_paths | length > 0
+      - config_paths | reject('match', '^/[^/].*') | list | length == 0
+
+- name: Require reviewed private cluster procedures before touching a clustered host
+  ansible.builtin.assert:
+    that: lookup('ansible.builtin.fileglob', inventory_dir ~ '/maintenance/' ~ patch_role ~ '/' ~ item ~ '.yml') | length > 0
+    fail_msg: "Supply the reviewed {{ patch_role }}/{{ item }} procedure for this topology."
+  loop: "{{ ['precheck','prepare','peers_offline','returned'] if patch_apply | default(false) | bool else ['precheck'] }}"
+  when: patch_topology == 'cluster'
+
+- name: Record the boot identity on entry
+  ansible.builtin.command: cat /proc/sys/kernel/random/boot_id
+  register: initial_boot
+  changed_when: false
+
+- name: Observe the currently running kernel
+  ansible.builtin.command: uname -r
+  register: initial_kernel
+  changed_when: false

@@ -1,0 +1,55 @@
+---
+- name: Create the lab mirror directory
+  ansible.builtin.file:
+    path: /srv/forge-repo
+    state: directory
+    mode: '0755'
+
+- name: Stage the exact kernel package builds for the guest architecture
+  ansible.builtin.get_url:
+    url: "{{ rocky_baseos_url | default('https://dl.rockylinux.org/pub/rocky/9.9/BaseOS') }}/{{ ansible_facts['architecture'] }}/os/Packages/k/{{ item }}.rpm"
+    dest: "/srv/forge-repo/{{ item }}.rpm"
+    mode: '0644'
+    timeout: 180
+    force: false
+  loop: "{{ patch_targets_nevra }}"
+  register: packages
+
+- name: Verify vendor signatures before publishing the lab metadata
+  ansible.builtin.command:
+    argv: [rpmkeys, -Kv, "/srv/forge-repo/{{ item }}.rpm"]
+  register: signature
+  changed_when: false
+  failed_when: signature.rc != 0 or 'Signature' not in signature.stdout or 'NOKEY' in signature.stdout
+  loop: "{{ patch_targets_nevra }}"
+
+- name: Render a synthetic advisory covering only the approved lab packages
+  ansible.builtin.template:
+    src: updateinfo.xml.j2
+    dest: /srv/forge-updateinfo.xml
+    mode: '0644'
+  register: advisory
+
+- name: Check whether the advisory was published
+  ansible.builtin.command: grep -q 'type="updateinfo"' /srv/forge-repo/repodata/repomd.xml
+  changed_when: false
+  failed_when: false
+  register: metadata
+
+- name: Publish RPM and advisory metadata
+  when: packages.changed or advisory.changed or metadata.rc != 0
+  block:
+    - name: Index the lab RPMs
+      ansible.builtin.command: createrepo_c /srv/forge-repo
+
+    - name: Publish the lab advisory
+      ansible.builtin.command: modifyrepo_c --mdtype=updateinfo /srv/forge-updateinfo.xml /srv/forge-repo/repodata
+
+- name: Configure the opt-in guest-local content source
+  ansible.builtin.yum_repository:
+    name: forge-lab
+    description: Approved local pilot content
+    baseurl: file:///srv/forge-repo
+    gpgcheck: true
+    gpgkey: file:///etc/pki/rpm-gpg/RPM-GPG-KEY-Rocky-9
+    enabled: false

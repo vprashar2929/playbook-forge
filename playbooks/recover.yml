@@ -1,0 +1,63 @@
+---
+- name: Boot the retained kernel on one reviewed and reachable host
+  hosts: patch_targets
+  become: true
+  any_errors_fatal: true
+  vars_files: [vars/window.yml]
+  tasks:
+    - name: Verify the change scope
+      ansible.builtin.import_tasks: tasks/identity.yml
+
+    - name: Require explicit approval and the tested single-node recovery topology
+      ansible.builtin.assert:
+        that:
+          - ansible_play_hosts_all | length == 1
+          - kernel_recovery_approved | default(false) | bool
+          - patch_topology == 'single_node'
+
+    - name: Read the held change
+      ansible.builtin.slurp:
+        src: "{{ hold_path }}/window.json"
+      register: context
+
+    - name: Decode the held host record
+      ansible.builtin.set_fact:
+        held: "{{ context.content | b64decode | from_json }}"
+
+    - name: Require a matching known change and a distinct previous kernel
+      ansible.builtin.assert:
+        that:
+          - held.host == inventory_hostname and held.role == patch_role and held.change == patch_change_id
+          - held.target == patch_kernel and initial_kernel.stdout == held.target
+          - held.before != held.target and held.before is match('^[0-9][a-zA-Z0-9._+-]+$')
+
+    - name: Inspect the retained boot entry
+      ansible.builtin.command:
+        argv: [grubby, "--info=/boot/vmlinuz-{{ held.before }}"]
+      changed_when: false
+
+    - name: Select the known previous kernel
+      ansible.builtin.command:
+        argv: [grubby, --set-default, "/boot/vmlinuz-{{ held.before }}"]
+
+    - name: Reboot and reconnect under the previous kernel
+      ansible.builtin.reboot:
+        reboot_timeout: "{{ patch_reboot_timeout | default(300) }}"
+
+    - name: Verify the recovery kernel
+      ansible.builtin.command: uname -r
+      register: recovery_kernel
+      changed_when: false
+      failed_when: recovery_kernel.stdout != held.before
+
+    - name: Verify service recovery
+      ansible.builtin.include_tasks: tasks/steady.yml
+
+    - name: Record recovery and keep the hold for review
+      ansible.builtin.include_tasks: tasks/evidence.yml
+      vars:
+        prior_kernel: "{{ held.target }}"
+        observed_kernel: "{{ recovery_kernel.stdout }}"
+        backup_dir: "{{ held.backup }}"
+        backup_verified: true
+        outcome: previous kernel verified - host remains held
